@@ -1,0 +1,10 @@
+uuu_version 1.5.165
+
+CFG: FB: -vid 0x18d1 -pid 0x4ee0
+
+FB: ucmd setenv fastboot_dev mmc
+FB: ucmd setenv fastboot_partition_alias_all 0.0:0
+
+FB: flash -raw2sparse all ../../../emmc.img
+
+FB: done

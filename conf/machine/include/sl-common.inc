@@ -75,15 +75,81 @@ EOF
         fi
         partition_count=$(expr $partition_count + 1)
     done
-    # Create a SYNAIMG-flash.tar.gz file with SYNAIMG, usb-tool and recovery folder inside.
-    install -d ${DEPLOY_DIR_IMAGE}/${SYNAIMG_DEPLOY_SUBDIR}-flash
-    (
-        cd ${DEPLOY_DIR_IMAGE}
-        cp -L -R syna-metadata/* syna-usb-tool/* ${SYNAIMG_DEPLOY_SUBDIR} ${SYNAIMG_DEPLOY_SUBDIR}-flash
-        tar -czf ${SYNAIMG_DEPLOY_SUBDIR}-flash.tar.gz -C ${DEPLOY_DIR_IMAGE} ${SYNAIMG_DEPLOY_SUBDIR}-flash
-    )
 }
-do_image_ota_ext4[depends] += "syna-metadata:do_deploy syna-usb-tool:do_deploy"
+
+python () {
+    if d.getVar('PN') == "torizon-docker":
+        bb.build.addtask('do_generate_emmc_rawimg', 'do_image_complete', 'do_image_ota_ext4', d)
+}
+
+do_generate_emmc_rawimg[depends] += " \
+    parted-native:do_populate_sysroot \
+    util-linux-native:do_populate_sysroot \
+    syna-metadata:do_deploy \
+    syna-usb-tool:do_deploy \
+    syna-uuu:do_deploy \
+    syna-uboot:do_deploy \
+    syna-winglet-scs:do_deploy \
+"
+
+do_generate_emmc_rawimg() {
+    set -e
+
+    IMG="${DEPLOY_DIR_IMAGE}/${IMAGE_LINK_NAME}.img"
+
+    get_mib_size() {
+        size_bytes=$(stat -c%s "$1")
+        echo $(expr \( $size_bytes + 1048575 \) / 1048576)
+    }
+
+    SIZE_KEY=$(get_mib_size "${DEPLOY_DIR_IMAGE}/key.subimg")
+    SIZE_TEE=$(get_mib_size "${DEPLOY_DIR_IMAGE}/tee.subimg")
+    SIZE_BL=$(get_mib_size "${DEPLOY_DIR_IMAGE}/bootloader.subimg")
+    SIZE_FW=$(get_mib_size "${DEPLOY_DIR_IMAGE}/firmware.subimg")
+    SIZE_ROOTFS=$(get_mib_size "${DEPLOY_DIR_IMAGE}/rootfs_ota.subimg")
+
+    SIZE_FACTORY=16
+
+    START_KEY=1
+    START_TEE=$(expr $START_KEY + $SIZE_KEY)
+    START_BL=$(expr $START_TEE + $SIZE_TEE)
+    START_FW=$(expr $START_BL + $SIZE_BL)
+    START_FACTORY=$(expr $START_FW + $SIZE_FW)
+    START_ROOTFS=$(expr $START_FACTORY + $SIZE_FACTORY)
+    DISK_END=$(expr $START_ROOTFS + $SIZE_ROOTFS + 1)
+
+    bbnote "Creating dynamic raw image: $IMG (${DISK_END} MiB)"
+
+    truncate -s ${DISK_END}M "$IMG"
+    parted -s "$IMG" mklabel gpt
+
+    parted -s "$IMG" mkpart key_a      ${START_KEY}MiB     ${START_TEE}MiB
+    parted -s "$IMG" mkpart tzk_a      ${START_TEE}MiB     ${START_BL}MiB
+    parted -s "$IMG" mkpart bl_a       ${START_BL}MiB      ${START_FW}MiB
+    parted -s "$IMG" mkpart firmware_a ${START_FW}MiB      ${START_FACTORY}MiB
+    parted -s "$IMG" mkpart factory    ${START_FACTORY}MiB ${START_ROOTFS}MiB
+    parted -s "$IMG" mkpart rootfs     ${START_ROOTFS}MiB  100%
+
+    dd if="${DEPLOY_DIR_IMAGE}/key.subimg"        of="$IMG" bs=1M seek=$START_KEY     conv=notrunc
+    dd if="${DEPLOY_DIR_IMAGE}/tee.subimg"        of="$IMG" bs=1M seek=$START_TEE     conv=notrunc
+    dd if="${DEPLOY_DIR_IMAGE}/bootloader.subimg" of="$IMG" bs=1M seek=$START_BL      conv=notrunc
+    dd if="${DEPLOY_DIR_IMAGE}/firmware.subimg"   of="$IMG" bs=1M seek=$START_FW      conv=notrunc
+    dd if="${DEPLOY_DIR_IMAGE}/rootfs_ota.subimg" of="$IMG" bs=1M seek=$START_ROOTFS  conv=notrunc
+
+    FLASH_DIR="${DEPLOY_DIR_IMAGE}/${SYNAIMG_DEPLOY_SUBDIR}-flash"
+    install -d "$FLASH_DIR"
+    cp "$IMG" "$FLASH_DIR/emmc.img"
+
+    cp -L -R ${DEPLOY_DIR_IMAGE}/syna-metadata/* "$FLASH_DIR/"
+    cp -L -R ${DEPLOY_DIR_IMAGE}/syna-usb-tool/* "$FLASH_DIR/"
+    cp -L -R ${DEPLOY_DIR_IMAGE}/syna-uuu/* "$FLASH_DIR/"
+    cp -L -R ${DEPLOY_DIR_IMAGE}/syna-uboot/* "$FLASH_DIR/"
+    cp -L -R ${DEPLOY_DIR_IMAGE}/syna-winglet-scs/* "$FLASH_DIR/"
+
+    # Create a SYNAIMG-flash.tar.gz file with the raw image, usb-tool and recovery folder inside.
+    tar -czf "${DEPLOY_DIR_IMAGE}/${SYNAIMG_DEPLOY_SUBDIR}-flash.tar.gz" \
+        -C "${DEPLOY_DIR_IMAGE}" "${SYNAIMG_DEPLOY_SUBDIR}-flash"
+}
 
 # Ensure do_image_synaimg runs after do_image_ostree completes since both copy from IMAGE_ROOTFS,
 # and if they run simultaneously it can cause FileNotFoundError on temporary files created by rsync/tar.

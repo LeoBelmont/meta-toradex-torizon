@@ -19,7 +19,11 @@ SYNAIMG_DEPLOY = "${DEPLOYDIR}/${BPN}"
 
 do_deploy() {
     install -d ${SYNAIMG_DEPLOY}
-    cp -r ${S}/bin/ ${SYNAIMG_DEPLOY}
+
+    mkdir -p ${SYNAIMG_DEPLOY}/bin
+    cp -r ${S}/bin/* ${SYNAIMG_DEPLOY}/bin/ || true
+    rm -rf ${SYNAIMG_DEPLOY}/bin/*/astra-update 2>/dev/null || true
+
     cp -r ${S}/astra-usbboot-images/ ${SYNAIMG_DEPLOY}
 }
 
