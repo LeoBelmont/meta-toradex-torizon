@@ -1,12 +1,12 @@
 SUMMARY = "Synaptics USB Tool"
 DESCRIPTION = "USB tools and drivers needed to flash images to the Synaptics Astra RDK boards"
-HOMEPAGE = "https://github.com/synaptics-astra/usb-tool"
+HOMEPAGE = "https://github.com/LeoBelmont/usb-tool"
 
 LICENSE = "CLOSED"
 
-PV = "1.0.5"
-SRC_URI = "git://github.com/synaptics-astra/usb-tool.git;protocol=https;branch=main"
-SRCREV = "e5e9a160ffb1755549e73457bda767e641439dc6"
+PV = "1.0.5+git"
+SRC_URI = "git://github.com/LeoBelmont/usb-tool.git;protocol=https;branch=${MACHINE}"
+SRCREV = "${AUTOREV}"
 
 S = "${WORKDIR}/git"
 

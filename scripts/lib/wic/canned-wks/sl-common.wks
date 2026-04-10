@@ -1,0 +1,19 @@
+# short-description: Create OTA-enabled eMMC image for Synaptics boards
+# long-description: Creates a partitioned eMMC image for Synaptics boards
+# using the canonical SYNAIMG partition layout (factory_setting first = GPT
+# partition 1). Subimages are produced by do_image_synaimg; rootfs is the OTA
+# ext4 image from do_image_ota_ext4.
+
+bootloader --ptable gpt
+
+part factory_setting --fstype=ext4 --label factory_setting --size=16M --align 1024
+
+part key_a --source rawcopy --sourceparams="file=key.subimg" --fstype=none --label key_a --align 1024
+
+part tzk_a --source rawcopy --sourceparams="file=tee.subimg" --fstype=none --label tzk_a --align 1024
+
+part bl_a --source rawcopy --sourceparams="file=bootloader.subimg" --fstype=none --label bl_a --align 1024
+
+part firmware_a --source rawcopy --sourceparams="file=firmware.subimg" --fstype=none --label firmware_a --align 1024
+
+part rootfs_a --source rawcopy --sourceparams="file=rootfs_ota.subimg" --fstype=ext4 --label otaroot --align 1024
