@@ -43,4 +43,9 @@ do_install:append () {
         fi
     fi
 }
-do_install[depends] += "${@'virtual/dtb:do_deploy' if '${PREFERRED_PROVIDER_virtual/dtb}' else ''}"
+# Only depend on virtual/dtb:do_deploy when a virtual/dtb provider is actually
+# set. Use d.getVar (not '${...}'): an unset var expands to the literal,
+# non-empty "${PREFERRED_PROVIDER_virtual/dtb}", which is wrongly truthy and adds
+# a bogus virtual/dtb dep that breaks bitbake 2.18's handleVirtRecipeProviders
+# on systemd-boot machines like imola (which have no virtual/dtb provider).
+do_install[depends] += "${@'virtual/dtb:do_deploy' if d.getVar('PREFERRED_PROVIDER_virtual/dtb') else ''}"
