@@ -26,10 +26,29 @@ Flash the `<image>.qcomflash/` directory (under `deploy/images/imola/`) with
 `qdl` over USB-C in EDL (9008) mode. First-boot debugging needs a UART adapter on
 the `ttyMSM0` debug pins (the USB-C exposes no serial console).
 
-Setup
-=====
-There is no Toradex `repo` manifest for qcom yet, so assemble the tree from
-Qualcomm's wrynose manifest plus the Arduino, Torizon and poky layers.
+Quick start (repo manifest)
+===========================
+A custom manifest, [`arduino-imola.xml`](./arduino-imola.xml), pins the whole
+layer set (Qualcomm wrynose BSP + meta-arduino + this layer + meta-poky). Put it
+in a small git repo (the manifest repo) and:
+
+```bash
+mkdir imola && cd imola
+repo init -u <git-repo-holding-arduino-imola.xml> -m arduino-imola.xml
+repo sync -j"$(nproc)"
+MACHINE=imola . setup-environment       # dispatches to setup-environment-qcom
+bitbake torizon-minimal
+```
+
+`setup-environment` (symlinked from this layer) detects `imola` and runs
+`scripts/lib/setup-devices/setup-environment-qcom`, which writes `bblayers.conf`
++ `local.conf`, drops the unavailable `qcom-3rdparty` layer dep, and sets the
+qcom mirrors/`OEROOT`/`BBMASK`s. `uno-q.conf` is shipped by this layer
+(`conf/machine/uno-q.conf`). So after `repo sync` it's two commands to a build.
+
+Manual setup
+============
+If you prefer to assemble the tree by hand instead of using the manifest:
 
 1. Sync the Qualcomm BSP:
    ```bash

@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+#
+# Common Torizon build setup for Qualcomm/Arduino machines (Arduino UNO Q / imola).
+# Mirrors the other setup-environment-<vendor> scripts. Unlike the Toradex BSP
+# flow this builds on top of openembedded-core (the qcom wrynose manifest) and
+# pulls meta-poky from meta-yocto.
+
+source ${_TDX_LAYERS_DIR}/oe-core/oe-init-build-env "${1:-build-$DISTRO}" >/dev/null 2>&1
+
+# meta-arduino-qcom declares a dependency on the qcom-3rdparty layer, which has
+# no wrynose branch; drop it so the layer is usable without it.
+_TDX_ARDUINO_QCOM_LAYERCONF="${_TDX_LAYERS_DIR}/meta-arduino/meta-arduino-qcom/conf/layer.conf"
+if [ -f "${_TDX_ARDUINO_QCOM_LAYERCONF}" ]; then
+    sed -i 's/ qcom-3rdparty//' "${_TDX_ARDUINO_QCOM_LAYERCONF}"
+fi
+
+if ! grep -q "# Torizon" conf/local.conf; then
+  _TDX_OEROOT=$(dirname "$(pwd)")
+  _TDX_BUILDDIR=$(pwd)
+
+  sed -i "/^MACHINE .*/c\MACHINE = \"${MACHINE}\"" conf/local.conf
+  sed -i "/^DISTRO .*/c\DISTRO = \"${DISTRO}\"" conf/local.conf
+  sed -i "/^#DL_DIR .*/c\DL_DIR ?= \"${_TDX_OEROOT}/downloads\"" conf/local.conf
+  sed -i "/^#SSTATE_DIR .*/c\SSTATE_DIR ?= \"${_TDX_OEROOT}/sstate-cache\"" conf/local.conf
+  sed -i "/^#TMPDIR .*/c\TMPDIR = \"${_TDX_BUILDDIR}/tmp\"" conf/local.conf
+
+  cat <<EOF >>conf/local.conf
+
+# Where to save the packages and images
+DEPLOY_DIR = "${_TDX_BUILDDIR}/deploy"
+
+# ease up disk space requirements
+INHERIT += "rm_work"
+
+# Qualcomm sources are mirrored on CodeLinaro
+MIRRORS:append = " \\
+    git://github.com git://git.codelinaro.org/clo/yocto-mirrors/github/ \\
+    git://.*/ git://git.codelinaro.org/clo/yocto-mirrors/ \\
+    https://.*/.*/ https://artifacts.codelinaro.org/codelinaro-le/ \\
+"
+SKIP_META_QCOM_SANITY_CHECK = "1"
+INHERIT:remove = "uninative"
+
+# Recipes not used by / not buildable for a minimal imola build
+BBMASK += "linux-yocto-fitimage"
+BBMASK += "linux-arduino-rt"
+BBMASK += "linux-arduino_%.bbappend"
+
+# Torizon
+include conf/machine/include/\${MACHINE}.inc
+
+EOF
+fi
+
+if ! grep -q "# Torizon" conf/bblayers.conf; then
+  cat <<EOF >>conf/bblayers.conf
+
+BBLAYERS += " \\
+  ${_TDX_LAYERS_DIR}/meta-yocto/meta-poky \\
+  ${_TDX_LAYERS_DIR}/meta-openembedded/meta-oe \\
+  ${_TDX_LAYERS_DIR}/meta-openembedded/meta-python \\
+  ${_TDX_LAYERS_DIR}/meta-openembedded/meta-networking \\
+  ${_TDX_LAYERS_DIR}/meta-openembedded/meta-filesystems \\
+  ${_TDX_LAYERS_DIR}/meta-qcom \\
+  ${_TDX_LAYERS_DIR}/meta-arduino/meta-arduino-common \\
+  ${_TDX_LAYERS_DIR}/meta-arduino/meta-arduino-qcom \\
+  ${_TDX_LAYERS_DIR}/meta-virtualization \\
+"
+
+# Torizon
+BBLAYERS += "${_TDX_LAYERS_DIR}/meta-toradex-torizon"
+# Torizon deps
+BBLAYERS += "${_TDX_LAYERS_DIR}/meta-updater"
+
+OEROOT := "\${@os.path.abspath(os.path.dirname(d.getVar('FILE', True)))}/../.."
+
+EOF
+fi
+
+cat <<EOF
+
+Welcome to Common Torizon OS (Arduino UNO Q / imola)
+
+Your build environment has been configured with:
+
+    MACHINE = ${MACHINE}
+    DISTRO = ${DISTRO}
+
+You can now run 'bitbake torizon-minimal'.
+
+EOF

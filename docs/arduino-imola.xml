@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Custom repo manifest for Common Torizon OS on the Arduino UNO Q (machine
+  "imola", Qualcomm QRB2210). It pins Qualcomm's wrynose BSP set plus the
+  Arduino, Torizon (wrynose) and meta-poky (from meta-yocto) layers.
+
+  Until this lands in toradex-manifest as common-torizon/arduino/integration.xml,
+  use it standalone (put this file in a small git repo, or point repo at it):
+
+    mkdir imola && cd imola
+    repo init -u <git-repo-holding-this-manifest> -m arduino-imola.xml
+    repo sync -j"$(nproc)"
+    MACHINE=imola . setup-environment        # dispatches to setup-environment-qcom
+    bitbake torizon-minimal
+
+  Layers are placed under layers/ and Torizon's setup-environment is symlinked at
+  the top level. Two things still live outside this manifest:
+    - uno-q.conf  : provided by meta-toradex-torizon for now (belongs upstream in
+                    meta-arduino-qcom); required by imola.conf.
+    - qcom-3rdparty layer dependency in meta-arduino-qcom: dropped automatically
+      by setup-environment-qcom (the layer has no wrynose branch).
+-->
+<manifest>
+  <remote name="github" fetch="https://github.com/"/>
+  <remote name="yocto"  fetch="https://git.yoctoproject.org/"/>
+
+  <default sync-j="4" clone-depth="1"/>
+
+  <!-- OpenEmbedded / Yocto core (wrynose), pinned to the qcom-linux-wrynose set -->
+  <project name="openembedded/bitbake"           path="layers/bitbake"             remote="github" revision="a2dd9be788274d9c7280be5b1be5eb5c3990cf54" upstream="refs/heads/2.18"/>
+  <project name="openembedded/openembedded-core" path="layers/oe-core"             remote="github" revision="8c008f36d7af1e63cb3f4a2ba763efd1f1e5fe4d" upstream="refs/heads/wrynose"/>
+  <project name="openembedded/meta-openembedded" path="layers/meta-openembedded"   remote="github" revision="d2e6069771e435231a220a8ecac20c0e7ceff037" upstream="refs/heads/wrynose"/>
+  <project name="git/meta-yocto"                 path="layers/meta-yocto"          remote="yocto"  revision="wrynose"/>
+
+  <!-- Qualcomm BSP (wrynose) -->
+  <project name="qualcomm-linux/meta-qcom"       path="layers/meta-qcom"           remote="github" revision="84a4dec161060ce6e477405dc08449274ca0c627" upstream="refs/heads/wrynose"/>
+
+  <!-- Arduino (meta-arduino-qcom on master) -->
+  <project name="arduino/meta-arduino"           path="layers/meta-arduino"        remote="github" revision="master"/>
+
+  <!-- Torizon deps: SOTA + virtualization -->
+  <project name="uptane/meta-updater"            path="layers/meta-updater"        remote="github" revision="d713c99a9ddace090c0efc0ed57022185daa6fb2" upstream="refs/heads/wrynose"/>
+  <project name="git/meta-virtualization"        path="layers/meta-virtualization" remote="yocto"  revision="4e6c583591c1da7e898254dd33eca5cc04c739a9" upstream="refs/heads/master"/>
+
+  <!-- Torizon: provides setup-environment + the imola machine (master targets wrynose;
+       using the fork branch that carries the imola machine until it merges upstream) -->
+  <project name="LeoBelmont/meta-toradex-torizon" path="layers/meta-toradex-torizon" remote="github" revision="wrynose-imola">
+    <linkfile dest="setup-environment" src="scripts/setup-environment"/>
+  </project>
+</manifest>
