@@ -26,6 +26,12 @@ if ! grep -q "# Torizon" conf/local.conf; then
 
   cat <<EOF >>conf/local.conf
 
+# Set MACHINE/DISTRO explicitly: oe-core's default local.conf has no DISTRO
+# line for the sed above to replace, so without this DISTRO stays "nodistro"
+# and common-torizon (hence sota) is never pulled in.
+MACHINE = "${MACHINE}"
+DISTRO = "${DISTRO}"
+
 # Where to save the packages and images
 DEPLOY_DIR = "${_TDX_BUILDDIR}/deploy"
 
