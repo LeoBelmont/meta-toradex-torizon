@@ -9,9 +9,9 @@ IMAGE_TEGRAFLASH_FS_TYPE = "ota-ext4"
 
 BBMASK += "meta-tegra/external/sota/recipes-bsp/uefi/edk2-firmware-tegra_%.bbappend"
 
-do_image_tegraflash[depends] += " tegra-minimal-initramfs:do_image_complete"
+do_image_tegraflash_tar[depends] += " tegra-minimal-initramfs:do_image_complete"
 
-IMAGE_INSTALL:append:tegra = " nvidia-docker"
+IMAGE_INSTALL:append:tegra = " nvidia-container-toolkit"
 
 MACHINE_EXTRA_RDEPENDS:remove = " tegra-redundant-boot"
 

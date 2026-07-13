@@ -22,7 +22,7 @@ RPROVIDES:${PN} += "u-boot-fw-utils"
 
 RDEPENDS:${PN} += " bash efivar e2fsprogs tegra-redundant-boot-base"
 
-S = "${WORKDIR}"
+S = "${UNPACKDIR}"
 
 PACKAGE_ARCH = "${MACHINE_ARCH}"
 
