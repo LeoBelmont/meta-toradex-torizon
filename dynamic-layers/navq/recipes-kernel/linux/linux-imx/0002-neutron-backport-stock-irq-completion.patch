@@ -1,0 +1,180 @@
+neutron: backport stock IRQ-completion + fixes from nxp-imx lf-6.12.y
+
+NavQ's kernel (NXP-Robotics/linux-imx, imx95-navq-lf-6.12.y) carries an older
+drivers/staging/neutron than stock nxp-imx/linux-imx lf-6.12.y. The fork hardwires
+inference completion to polling mode (inf->poll_mode = true) and never arms the
+inference-done IRQ, so on i.MX95 the NPU boots and clocks up but every invoke ends
+in "Inference poll timeout" (Neutron Driver code=1497) and the imx-neutron-mailbox
+IRQ (GIC_SPI 318 / Linux GICv3 350) count stays at 0. The Verdin i.MX95, which runs
+the stock driver, completes because it waits on the inference-done IRQ.
+
+Backport the stock driver delta (self-contained to drivers/staging/neutron; Kconfig,
+Makefile, uapi and the other headers are byte-identical between fork and stock):
+ - neutron_driver.c:   add 'use_irq' module param (default true) -> NEUTRON_USE_IRQ_MODE,
+                       re-enable IRQ on resume
+ - neutron_device.{c,h}: add neutron_irq_enable() + the IRQ-enable bit defines + flag
+ - neutron_inference.c: use IRQ mode when the flag is set; pm_runtime_get/put_sync and
+                       a mutex around send_reset; kref guard on the done path
+ - neutron_mailbox.c:  clear APPSTATUS via W1C in the IRQ handler
+
+Upstream-Status: Backport [nxp-imx/linux-imx lf-6.12.y; should be merged into NXP-Robotics/linux-imx]
+Signed-off-by: Leonardo Bornia <leonardo.bornia@toradex.com>
+
+--- a/drivers/staging/neutron/neutron_driver.c
++++ b/drivers/staging/neutron/neutron_driver.c
+@@ -40,6 +40,11 @@
+ module_param(power_mode, int, 0644);
+ MODULE_PARM_DESC(power_mode, "Power consumption strategy mode, 0:auto balance mode; 1:best performance mode; 2:low power mode");
+ 
++static bool use_irq = true;
++
++module_param(use_irq, bool, 0644);
++MODULE_PARM_DESC(use_irq, "Enable IRQ mode for the inference job, set it to 0 for polling mode.");
++
+ static struct class *neutron_class;
+ static dev_t devt;
+ static DECLARE_BITMAP(minors, MINOR_COUNT);
+@@ -84,6 +89,11 @@
+ 	if (power_mode == POWER_MODE_PERF)
+ 		ndev->suspend_delay +=  100 * MSEC_PER_SEC;
+ 
++	if (use_irq)
++		ndev->flags |= NEUTRON_USE_IRQ_MODE;
++	else
++		ndev->flags &= (~NEUTRON_USE_IRQ_MODE);
++
+ 	pm_runtime_enable(&pdev->dev);
+ 
+ 	pm_runtime_set_autosuspend_delay(&pdev->dev, ndev->suspend_delay);
+@@ -164,6 +174,10 @@
+ 	if (ndev->power_state == NEUTRON_POWER_ON)
+ 		neutron_rproc_boot(ndev, NULL);
+ 
++	/* Re-enable the IRQ after the system resumes from suspend */
++	if (ndev->flags & NEUTRON_USE_IRQ_MODE)
++		neutron_irq_enable(ndev);
++
+ 	return 0;
+ }
+ #endif
+--- a/drivers/staging/neutron/neutron_device.c
++++ b/drivers/staging/neutron/neutron_device.c
+@@ -665,6 +665,16 @@
+ 	return ret;
+ }
+ 
++void neutron_irq_enable(struct neutron_device *ndev)
++{
++	u32 val;
++
++	/* Setup irq register */
++	val = readl(ndev->reg_base + INTENA);
++	val |= (SHUTDOWN_IRQ_ENABLE | INFERENCE_DONE_IRQ_ENABLE);
++	writel(val, ndev->reg_base + INTENA);
++}
++
+ int neutron_dev_init(struct neutron_device *ndev,
+ 		     struct device *dev, int irq,
+ 		    struct class *class, dev_t devt)
+--- a/drivers/staging/neutron/neutron_device.h
++++ b/drivers/staging/neutron/neutron_device.h
+@@ -67,6 +67,12 @@
+ #define NEUTRON_POWER_OFF    0
+ #define NEUTRON_POWER_ON     1
+ #define SPECIFIC_DMA_POOL      BIT(0)
++#define NEUTRON_USE_IRQ_MODE   BIT(1)
++
++// IRQ
++#define INFERENCE_DONE_IRQ_ENABLE   BIT(1)
++#define MBOX_IRQ_ENABLE             BIT(2)
++#define SHUTDOWN_IRQ_ENABLE         BIT(7)
+ 
+ #define ZENV_CLK_ON         (0x1 << 0)
+ #define COMPUTE_CLK_ON      (0xF << 4)
+@@ -144,6 +150,7 @@
+ 			 size_t size, enum dma_data_direction dir);
+ void neutron_clk_enable(struct neutron_device *ndev);
+ void neutron_clk_disable(struct neutron_device *ndev);
++void neutron_irq_enable(struct neutron_device *ndev);
+ 
+ #endif /* NEUTRON_DEVICE_H */
+ 
+--- a/drivers/staging/neutron/neutron_inference.c
++++ b/drivers/staging/neutron/neutron_inference.c
+@@ -281,6 +281,9 @@
+ 	if (!inf || IS_ERR(inf))
+ 		return;
+ 
++	if (!kref_read(&inf->kref))
++		return;
++
+ 	neutron_inference_get(inf);
+ 
+ 	/* Update inference job from running to done */
+@@ -290,6 +293,8 @@
+ 	ndev = inf->ndev;
+ 	mbox = ndev->mbox;
+ 
++	pm_runtime_get_sync(ndev->dev);
++
+ 	/* Sync the output data for cpu after inference is done */
+ 	neutron_memory_sync(ndev, inf->buf->dma_addr + inf->args.output_offset,
+ 			    inf->args.output_size, DMA_FROM_DEVICE);
+@@ -298,8 +303,10 @@
+ 	wake_up_interruptible(&inf->waitq);
+ 
+ 	/* Reset neutron */
++	mutex_lock(&ndev->mutex);
+ 	if (mbox->ops->send_reset(ndev->mbox))
+ 		dev_warn(ndev->dev, "failed to reset neutron state\n");
++	mutex_unlock(&ndev->mutex);
+ 
+ 	dev_dbg(ndev->dev, "inf %x is done\n", inf->args.tensor_offset);
+ 
+@@ -316,6 +323,8 @@
+ 	 */
+ 	else if (ndev->power_mode >= POWER_MODE_LOW)
+ 		neutron_clk_disable(ndev);
++
++	pm_runtime_put_sync(ndev->dev);
+ }
+ 
+ static void neutron_inference_kref_destroy(struct kref *kref)
+@@ -432,8 +441,14 @@
+ 
+ 	inf->ndev = ndev;
+ 	inf->cmd_type = type;
++
++	/* use irq mode */
++	if (ndev->flags & NEUTRON_USE_IRQ_MODE)
++		inf->poll_mode = false;
++
+ 	/* use polling mode */
+-	inf->poll_mode = true;
++	else
++		inf->poll_mode = true;
+ 
+ 	kref_init(&inf->kref);
+ 	init_waitqueue_head(&inf->waitq);
+--- a/drivers/staging/neutron/neutron_mailbox.c
++++ b/drivers/staging/neutron/neutron_mailbox.c
+@@ -14,10 +14,6 @@
+ 
+ #define DRIVER_NAME	"imx-neutron-mailbox"
+ 
+-#define INFERENCE_DONE_IRQ_ENABLE	BIT(1)
+-#define MBOX_IRQ_ENABLE			BIT(2)
+-#define SHUTDOWN_IRQ_ENABLE		BIT(7)
+-
+ #define MAX_SEND_MSG_ARGC		4
+ #define MAX_RECV_MSG_ARGC		2
+ #define SEND_MSG_ARG(n)			(MBOX3 + (((n) + 1) << 2))
+@@ -208,6 +204,8 @@
+ 
+ 	/* Clear irq */
+ 	writel(val, mbox->base + INTCLR);
++	/* Clear status via W1C */
++	writel(appstatus, mbox->base + APPSTATUS);
+ 	/* Enable irq again */
+ 	writel(val, mbox->base + INTENA);
+ 
