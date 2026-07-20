@@ -1,0 +1,51 @@
+imx95-navqb: add Neutron NPU DMA pool (reserved-memory)
+
+The base imx95.dtsi neutron node ships with no memory-region. NXP enables the
+NPU on the i.MX95 EVK via the imx95-19x19-evk-neutron.dtso overlay, which the
+NavQ device tree never applies. Without a DMA pool the Neutron NPU loads its
+firmware and clocks up, but an inference never completes: the completion IRQ
+(GIC_SPI 318 == Linux GICv3 350, "imx-neutron-mailbox") never fires and the eIQ
+Neutron TFLite delegate returns "Neutron Driver timeout (code=1497)".
+
+Add the same pool here in the navqb board dts so it lands in imx95-navqb.dtb
+(u-boot auto-selects that dtb by board name, so no boot-path change is needed).
+NavQ95 has >=8 GiB and u-boot fixes up the memory node at runtime, so the EVK's
+4 GiB pool at 0x1_0000_0000 fits above every existing reservation with no
+collision. "reusable" makes it a shared-dma CMA pool, available to the system
+until the NPU claims it.
+
+Upstream-Status: Inappropriate [NavQ95 board integration; should be fixed in NXP-Robotics/linux-imx]
+Signed-off-by: Leonardo Bornia <leonardo.bornia@toradex.com>
+
+--- a/arch/arm64/boot/dts/freescale/imx95-navqb.dts
++++ b/arch/arm64/boot/dts/freescale/imx95-navqb.dts
+@@ -1032,3 +1032,29 @@
+ };
+ 
+ 
++
++/*
++ * Neutron NPU DMA pool. Mirror of NXP's imx95-19x19-evk-neutron.dtso, applied
++ * here in the board dts so it lands in imx95-navqb.dtb (u-boot auto-selects
++ * that dtb by board name; no boot-path change needed).
++ *
++ * The base imx95.dtsi neutron node has no memory-region, so without this pool
++ * the NPU loads its firmware and clocks up but an inference never completes:
++ * the completion IRQ (GIC_SPI 318 == Linux GICv3 350, "imx-neutron-mailbox")
++ * never fires and the delegate returns "Neutron Driver timeout". NavQ95 has
++ * >=8 GiB (u-boot fixes up the memory node at runtime), so the EVK's 4 GiB pool
++ * at 0x1_0000_0000 fits above all existing reservations with no collision.
++ * "reusable" makes it a shared-dma CMA pool, usable by the system until the
++ * NPU claims it.
++ */
++&{/reserved-memory} {
++	neutron_mem: neutron_memory@100000000 {
++		compatible = "shared-dma-pool";
++		reusable;
++		reg = <0x1 0x00000000 0x1 0x00000000>;
++	};
++};
++
++&neutron {
++	memory-region = <&neutron_mem>;
++};
