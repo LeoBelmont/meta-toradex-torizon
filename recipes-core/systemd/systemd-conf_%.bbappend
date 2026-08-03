@@ -3,6 +3,7 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/${BPN}:"
 SRC_URI += "\
     file://system.conf-torizon \
     file://system.conf-docker \
+    file://networkd-wait-online-timeout.conf \
 "
 
 PACKAGE_ARCH = "${MACHINE_ARCH}"
@@ -18,6 +19,12 @@ do_install:append() {
 	install -m 0644 ${S}/system.conf-docker ${D}${systemd_unitdir}/system.conf.d/20-docker.conf
 
 	sed -i "s/@@MACHINE@@/${MACHINE}/g" ${D}${systemd_unitdir}/system.conf.d/10-${BPN}.conf
+
+	# meta-imx's 50- drop-in strips our --timeout=5, leaving systemd's 120s default.
+	# A later-sorting drop-in restores it.
+	install -d ${D}${systemd_unitdir}/system/systemd-networkd-wait-online.service.d/
+	install -m 0644 ${S}/networkd-wait-online-timeout.conf \
+		${D}${systemd_unitdir}/system/systemd-networkd-wait-online.service.d/99-${BPN}-timeout.conf
 }
 
 do_install:append:aquila-am69() {
