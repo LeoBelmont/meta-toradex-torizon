@@ -1,0 +1,42 @@
+imx95-navqb: disable the BT UART that stalls boot for 60s
+
+The board dts enables an 88W8987 Bluetooth controller on lpuart4, but the chip
+never answers btnxpuart's bootloader handshake:
+
+    Bluetooth: hci0: FW Download Timeout. offset: 0
+
+"offset: 0" means not a single bootloader signature byte was received. The wait in
+nxp_download_firmware() is a hardcoded 60000 ms and btnxpuart has no module
+parameters, so every boot pays a fixed 60s penalty before failing. That also stalls
+udev long enough for NetworkManager-wait-online to give up.
+
+The likely cause is firmware ownership: NXP's out-of-tree Wi-Fi driver (moal) brings
+up the combo part over SDIO (sduart8987_combo.bin) before btnxpuart probes, leaving
+the chip past its bootloader, so the UART side never re-enters download mode. The
+module reset is also not asserted as described -- the kernel rejects this board's
+reset-gpios flags:
+
+    reset-gpio code does not support GPIO flags 7 for GPIO 16
+
+(usdhc3_pwrseq, i2c3_ioexp23 pin 16, GPIO_ACTIVE_LOW | GPIO_OPEN_DRAIN = 7)
+
+Bluetooth is unused on this integration and there is no BT userspace in the image,
+so disable the node rather than pay the timeout. Re-enable it together with either
+a Wi-Fi-only moal firmware (sd8987_wlan.bin, leaving uart8987_bt.bin to btnxpuart)
+or a userspace btattach flow on the already-running combo firmware.
+
+Upstream-Status: Inappropriate [NavQ95 board integration; should be fixed in NXP-Robotics/linux-imx]
+Signed-off-by: Leonardo Bornia <leonardo.bornia@toradex.com>
+
+--- a/arch/arm64/boot/dts/freescale/imx95-navqb.dts
++++ b/arch/arm64/boot/dts/freescale/imx95-navqb.dts
+@@ -884,7 +884,7 @@
+ 	pinctrl-names = "default";
+ 	pinctrl-0 = <&pinctrl_uart4>;
+ 	uart-has-rtscts;
+-	status = "okay";
++	status = "disabled";
+ 
+ 	bluetooth {
+ 		compatible = "nxp,88w8987-bt";
+ 

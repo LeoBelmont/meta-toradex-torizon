@@ -1,0 +1,37 @@
+imx95-navqb: add Neutron NPU DMA pool (reserved-memory)
+
+The base imx95.dtsi neutron node ships with no memory-region and the NavQ board
+dts does not assign one, so the Neutron NPU has no dedicated DMA pool. Add a
+reserved shared-dma-pool and bind it to the neutron node.
+
+NavQ95 has >=8 GiB and u-boot fixes up the memory node at runtime, so a 4 GiB
+pool at 0x1_0000_0000 fits above the existing reservations with no collision.
+"reusable" makes it a shared-dma CMA pool, available to the system until the NPU
+claims it.
+
+Regenerated for the wrynose imx95-navq-lf-6.18.y kernel: the driver already
+carries the stock IRQ-completion path (so the walnascar 0002 backport is dropped),
+but the neutron node still lacks a memory-region. Appended at the end of the board
+dts. HARDWARE-UNVERIFIED on wrynose.
+
+Upstream-Status: Inappropriate [NavQ95 board integration; should be fixed in NXP-Robotics/linux-imx]
+Signed-off-by: Leonardo Bornia <leonardo.bornia@toradex.com>
+
+--- a/arch/arm64/boot/dts/freescale/imx95-navqb.dts
++++ b/arch/arm64/boot/dts/freescale/imx95-navqb.dts
+@@ -1646,3 +1646,15 @@
+ 	boot = <&vpu_boot>;
+ 	sram = <&sram1>;
+ };
++
++&{/reserved-memory} {
++	neutron_mem: neutron_memory@100000000 {
++		compatible = "shared-dma-pool";
++		reusable;
++		reg = <0x1 0x00000000 0x1 0x00000000>;
++	};
++};
++
++&neutron {
++	memory-region = <&neutron_mem>;
++};

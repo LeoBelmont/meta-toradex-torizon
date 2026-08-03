@@ -1,0 +1,45 @@
+imx95-navqb: disable the unpopulated SJA1110 switch and its CPU port
+
+The NavQ95 board dts enables an SJA1110A TSN switch on lpspi4 CS1 and its
+enetc_port2 CPU port, but the switch is not populated on this board: the driver
+reads an all-ones device ID and bails out.
+
+    sja1105 spi0.1: Unexpected {device ID, part number}: 0xffffffff 0xffff
+    sja1105 spi0.1: Device ID check failed: -19
+
+meta-nxp-mr also carries no SJA1110 firmware or recipes on the wrynose branch, and
+every switch port in this dts is already status = "disabled", so the switch cannot
+be used as-is.
+
+enetc_port2 is worse than merely unused: it is a fixed-link 2500base-x port, so the
+kernel reports carrier unconditionally ("Link is Up - 2.5Gbps/Full") even with
+nothing behind it. NetworkManager then auto-activates it, retries DHCP every 45s
+forever, never reaches startup-complete, and NetworkManager-wait-online fails --
+delaying boot. The board has a single RJ45, driven by enetc_port0 via the RTL8211F.
+
+Disable both. Re-enable them if a board revision populates the switch (and add the
+SJA1110 firmware, which this BSP branch lacks).
+
+Upstream-Status: Inappropriate [NavQ95 board integration; should be fixed in NXP-Robotics/linux-imx]
+Signed-off-by: Leonardo Bornia <leonardo.bornia@toradex.com>
+
+--- a/arch/arm64/boot/dts/freescale/imx95-navqb.dts
++++ b/arch/arm64/boot/dts/freescale/imx95-navqb.dts
+@@ -908,7 +908,8 @@
+ 		compatible = "nxp,sja1110a";
+ 		reg = <1>;
+ 		spi-max-frequency = <4000000>;
+ 		dsa,member = <0 0>;
++		status = "disabled";
+ 
+ 		ethernet-ports {
+ 			#address-cells = <1>;
+@@ -1079,6 +1079,6 @@
+ };
+ 
+ &enetc_port2 {
+-	status = "okay";
++	status = "disabled";
+ };
+ 
+ 

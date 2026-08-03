@@ -76,6 +76,8 @@ _TDX_COMMON_MACHINES=("am62lxx-evm"   "meta-ti-bsp" \
                  "beagley-ai"         "meta-beagle" \
                  "imx93frdm"          "meta-imx-frdm/meta-imx-bsp" \
                  "imx95-19x19-verdin" "meta-imx" \
+                 "imx95-navqa"        "meta-nxp-mr" \
+                 "imx95-navqb"        "meta-nxp-mr" \
                  "intel-corei7-64"    "meta-intel" \
                  "jetson-orin-nano-devkit" "meta-tegra" \
                  "jetson-orin-nano-devkit-nvme" "meta-tegra" \
@@ -164,6 +166,9 @@ else
         ;;
         imx95-19x19-verdin)
             # for iMX95, there's only common-torizon as possible DISTRO
+            _TDX_DISTRO_SELECT="common-torizon" . ${_TDX_SCRIPTS_PATH}/setup-environment-imx $@
+        ;;
+        imx95-navqa|imx95-navqb)
             _TDX_DISTRO_SELECT="common-torizon" . ${_TDX_SCRIPTS_PATH}/setup-environment-imx $@
         ;;
         imx93frdm)

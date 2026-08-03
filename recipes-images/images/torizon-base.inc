@@ -150,6 +150,11 @@ CORE_IMAGE_BASE_INSTALL:append:mx93-nxp-bsp = " \
     ethos-u-driver-stack \
 "
 
+# Neutron NPU firmware; loaded by the host kernel, so containers can't provide it.
+CORE_IMAGE_BASE_INSTALL:append:imx95-navq = " \
+    neutron \
+"
+
 nss_altfiles_set_users_groups () {
 	# Make a temporary directory to be used by pseudo to find the real /etc/passwd,/etc/group
 	pseudo_dir=${WORKDIR}/pseudo-rootfs${sysconfdir}
