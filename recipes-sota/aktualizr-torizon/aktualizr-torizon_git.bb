@@ -15,7 +15,7 @@ SRC_URI = " \
   https://github.com/uptane/ota-tuf/releases/download/v${UPTANE_SIGN_PV}/cli-${UPTANE_SIGN_PV}.tgz;unpack=0;name=uptanesign \
 "
 
-SRCREV = "29a7d4bd073f762d24cb0968b814dcb488a98847"
+SRCREV = "b16069ce2f25393c1e3f885752862af75161ec7c"
 SRCREV:use-head-next = "${AUTOREV}"
 
 PV = "1.0+git${SRCPV}"
@@ -51,10 +51,10 @@ do_install:append() {
     install -d ${D}${systemd_unitdir}/system
     install -m 0644 ${UNPACKDIR}/aktualizr-torizon.service ${D}${systemd_unitdir}/system/aktualizr-torizon.service
 
-    install -m 0700 -d ${D}${libdir}/sota/conf.d 
+    install -m 0700 -d ${D}${libdir}/sota/conf.d
     install -m 0644 ${S}/config/sota-device-cred.toml ${D}/${libdir}/sota/conf.d/20-sota-device-cred.toml
     install -m 0644 ${S}/config/sota-uboot-env.toml ${D}/${libdir}/sota/conf.d/30-rollback.toml
-    
+
     install -m 0644 ${UNPACKDIR}/gateway.url ${D}/${libdir}/sota/gateway.url
     install -m 0644 ${UNPACKDIR}/root.crt ${D}/${libdir}/sota/root.crt
 
@@ -86,7 +86,7 @@ FILES:${PN}-dev = " \
 "
 
 FILES:${PN}-misc = " \
-  ${bindir}/aktualizr-secondary \ 
+  ${bindir}/aktualizr-secondary \
   ${libdir}/libaktualizr_secondary.so \
   ${libdir}/libsota_tools.so \
   ${bindir}/aktualizr-get \
