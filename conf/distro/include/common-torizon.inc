@@ -43,6 +43,10 @@ IMAGE_LINGUAS ?= "en-us"
 # | QA Issue: Package version went backwards which would break package feeds
 ERROR_QA:remove = "version-going-backwards"
 
+# Many -dbg packages embed the build path; only debug symbols are affected.
+ERROR_QA:remove = "buildpaths"
+WARN_QA:append = " buildpaths"
+
 DISTRO_FEATURES:append = " pam systemd usrmerge"
 DISTRO_FEATURES:remove = "sysvinit ptest"
 VIRTUAL-RUNTIME_init_manager = "systemd"
