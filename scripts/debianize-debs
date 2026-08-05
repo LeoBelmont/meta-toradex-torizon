@@ -505,19 +505,58 @@ def debianize(deb, args):
 def reexec_in_docker(args, argv):
     """Re-run inside an arm64 Debian container.
 
-    dpkg-shlibdeps reads the local shlibs data, so it has to run where the
-    dpkg architecture matches the packages being processed.
+    dpkg-shlibdeps reads the local shlibs data, so it has to run where the dpkg
+    architecture matches the packages being processed.
+
+    Every host path involved has to be mounted, not just the working directory:
+    the script itself usually lives in a layer beside the build directory, and
+    the .deb inputs may be anywhere.  Output is chowned back to the caller
+    afterwards because apt-get needs root inside the container.
     """
-    cwd = os.getcwd()
-    cmd = ["docker", "run", "--rm", "--platform", "linux/arm64",
-           "-v", "%s:%s" % (cwd, cwd), "-w", cwd, args.docker_image,
-           "sh", "-c",
-           "apt-get update -qq && apt-get install -y -qq --no-install-recommends "
-           "dpkg-dev binutils%s >/dev/null && exec python3 %s" % (
-               " lintian" if args.lintian else "",
-               " ".join("'%s'" % a for a in argv if a != "--docker"))]
+    mounts = {os.getcwd(), os.path.dirname(os.path.realpath(argv[0]))}
+    makedirs(args.outdir)
+    mounts.add(os.path.abspath(args.outdir))
+    for item in args.debs:
+        path = os.path.abspath(item)
+        mounts.add(path if os.path.isdir(path) else os.path.dirname(path))
+    if args.license_file:
+        mounts.add(os.path.dirname(os.path.abspath(args.license_file)))
+
+    # Drop any path already covered by an ancestor, so docker is not handed
+    # nested bind mounts.
+    minimal = sorted(
+        p for p in mounts
+        if not any(p != q and p.startswith(q.rstrip(os.sep) + os.sep)
+                   for q in mounts))
+
+    cmd = ["docker", "run", "--rm", "--platform", "linux/arm64"]
+    for path in minimal:
+        cmd += ["-v", "%s:%s" % (path, path)]
+    cmd += ["-w", os.getcwd(),
+            "-e", "DEBIANIZE_CHOWN=%d:%d" % (os.getuid(), os.getgid()),
+            args.docker_image, "sh", "-c",
+            "apt-get update -qq && apt-get install -y -qq --no-install-recommends "
+            "python3 dpkg-dev binutils%s >/dev/null && exec python3 %s" % (
+                " lintian" if args.lintian else "",
+                " ".join("'%s'" % a for a in argv if a != "--docker"))]
     print("re-executing in %s (linux/arm64)" % args.docker_image)
+    print("  mounts: %s" % ", ".join(minimal))
     os.execvp("docker", cmd)
+
+
+def chown_back(path):
+    """Hand the output back to the invoking user after running as root in docker."""
+    spec = os.environ.get("DEBIANIZE_CHOWN")
+    if not spec or os.geteuid() != 0:
+        return
+    uid, _, gid = spec.partition(":")
+    for dirpath, dirs, files in os.walk(path):
+        for name in [""] + list(dirs) + list(files):
+            target = os.path.join(dirpath, name) if name else dirpath
+            try:
+                os.chown(target, int(uid), int(gid), follow_symlinks=False)
+            except OSError:
+                pass
 
 
 def main():
