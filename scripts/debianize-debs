@@ -1,0 +1,594 @@
+#!/usr/bin/env python3
+"""Turn OE package_deb output into a Debian-valid .deb.
+
+OE's package_deb backend writes a real .deb, but three things in it are wrong
+for a Debian container:
+
+  Depends       OE resolves SONAMEs against OE package names -- libdrm.so.2
+                becomes "libdrm", where Debian has "libdrm2" -- and it has no
+                way to emit versioned dependencies like "libc6 (>= 2.38)".
+                Getting those right needs Debian's shlibs/symbols data, which
+                only exists in a Debian sysroot.  That is the whole reason this
+                script exists and why it runs outside the OE build.
+  policy files  no DEBIAN/md5sums, no ldconfig trigger, no
+                /usr/share/doc/<pkg>/{copyright,changelog.Debian.gz}
+  junk fields   package_deb writes non-standard "OE:" and "PackageArch:"
+
+Everything here is mechanical.  The only thing it cannot produce is the
+Description, which comes from SUMMARY and DESCRIPTION in the recipe.
+
+Run it in an environment whose dpkg architecture matches the packages, because
+dpkg-shlibdeps consults the local shlibs data.  For arm64 packages on an amd64
+host, use --docker to re-exec inside an arm64 Debian container.
+"""
+
+import argparse
+import gzip
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+# Fields package_deb emits that are not Debian control fields.
+JUNK_FIELDS = ("OE", "PackageArch")
+
+# Directories a shared library has to live in for ldconfig to matter.
+LIBDIRS = ("lib", "usr/lib", "usr/local/lib")
+
+
+# ---------------------------------------------------------------------------
+# control file handling
+# ---------------------------------------------------------------------------
+
+class Control:
+    """An RFC822 control stanza that preserves field order and continuations."""
+
+    def __init__(self, text):
+        self.fields = []                    # [(name, value)], value may be multiline
+        name = None
+        buf = []
+        for line in text.splitlines():
+            if line[:1] in (" ", "\t") and name:
+                buf.append(line)
+                continue
+            if name:
+                self.fields.append((name, "\n".join(buf)))
+            if not line.strip():
+                name, buf = None, []
+                continue
+            name, _, value = line.partition(":")
+            name = name.strip()
+            buf = [value.strip()]
+        if name:
+            self.fields.append((name, "\n".join(buf)))
+
+    def get(self, name, default=None):
+        for key, value in self.fields:
+            if key.lower() == name.lower():
+                return value
+        return default
+
+    def set(self, name, value):
+        for index, (key, _) in enumerate(self.fields):
+            if key.lower() == name.lower():
+                self.fields[index] = (name, value)
+                return
+        self.fields.append((name, value))
+
+    def drop(self, name):
+        self.fields = [(k, v) for k, v in self.fields if k.lower() != name.lower()]
+
+    def render(self):
+        # Debian expects Package first; the rest of the order is cosmetic but
+        # keeping it stable makes diffs between runs readable.
+        order = ["Package", "Version", "Architecture", "Multi-Arch", "Section",
+                 "Priority", "Maintainer", "Homepage", "Vcs-Git", "Vcs-Browser",
+                 "Depends", "Recommends", "Suggests", "Provides", "Replaces",
+                 "Conflicts", "Breaks", "Description"]
+        ranked = sorted(self.fields,
+                        key=lambda kv: (order.index(kv[0]) if kv[0] in order
+                                        else len(order), kv[0]))
+        return "".join("%s: %s\n" % (k, v) for k, v in ranked)
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, check=True, text=True, capture_output=True, **kw)
+
+
+def makedirs(path):
+    """os.makedirs, but 0755 regardless of the caller's umask.
+
+    A 0775 directory in a .deb is a lintian error, and the umask of whoever runs
+    this script must not decide the contents of a package.
+    """
+    # Only chmod the components this call actually creates.  Walking up to / and
+    # chmodding whatever exists would try to touch /tmp.
+    missing = []
+    walk = os.path.abspath(path)
+    while not os.path.isdir(walk):
+        missing.append(walk)
+        parent = os.path.dirname(walk)
+        if parent == walk:
+            break
+        walk = parent
+    os.makedirs(path, exist_ok=True)
+    for created in missing:
+        os.chmod(created, 0o755)
+
+
+def normalize_times(root, epoch):
+    """Set every mtime to a fixed value so repeated runs are byte-identical.
+
+    dpkg-deb records mtimes in the payload tar, so without this the output
+    changes on every run and there is no way to tell a real change from a
+    rebuild.
+    """
+    for dirpath, dirs, files in os.walk(root):
+        for name in list(dirs) + list(files):
+            path = os.path.join(dirpath, name)
+            try:
+                os.utime(path, (epoch, epoch), follow_symlinks=False)
+            except (NotImplementedError, OSError):
+                pass
+    os.utime(root, (epoch, epoch))
+
+
+def elf_files(root):
+    """Every ELF shared object or executable in the unpacked tree."""
+    found = []
+    for dirpath, _dirs, files in os.walk(root):
+        if os.path.relpath(dirpath, root).startswith("DEBIAN"):
+            continue
+        for name in sorted(files):
+            path = os.path.join(dirpath, name)
+            if os.path.islink(path) or not os.path.isfile(path):
+                continue
+            with open(path, "rb") as handle:
+                if handle.read(4) != b"\x7fELF":
+                    continue
+            found.append(path)
+    return found
+
+
+def soname(path):
+    try:
+        out = run(["objdump", "-p", path]).stdout
+    except subprocess.CalledProcessError:
+        return None
+    for line in out.splitlines():
+        if "SONAME" in line:
+            return line.split()[-1]
+    return None
+
+
+def derive_name(root):
+    """Debian shared-library package name from the SONAME: libfoo.so.1 -> libfoo1.
+
+    Only applies when the package ships exactly one versioned library, which is
+    the common case for these vendor packages.  Anything else is ambiguous and
+    is left to --rename.
+    """
+    sonames = set()
+    for path in elf_files(root):
+        name = soname(path)
+        if name and ".so." in name:
+            sonames.add(name)
+    if len(sonames) != 1:
+        return None
+    name = sonames.pop()
+    stem, _, version = name.partition(".so.")
+    major = version.split(".")[0]
+    return "%s%s" % (stem, major)
+
+
+def ships_shared_library(root):
+    for dirpath, _dirs, files in os.walk(root):
+        rel = os.path.relpath(dirpath, root)
+        if not any(rel == d or rel.startswith(d + os.sep) for d in LIBDIRS):
+            continue
+        for name in files:
+            if ".so." in name:
+                return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# the fix-ups
+# ---------------------------------------------------------------------------
+
+def compute_depends(root, args):
+    """Debian Depends via dpkg-shlibdeps, run against the real sysroot.
+
+    dpkg-shlibdeps insists on being run from a source package, so a stub
+    debian/control is enough to satisfy it.  --ignore-missing-info is required
+    because vendor libraries belong to no Debian package; -l tells it where to
+    find them so their own dependencies still resolve.
+    """
+    binaries = elf_files(root)
+    if not binaries:
+        return None
+
+    with tempfile.TemporaryDirectory() as stub:
+        os.makedirs(os.path.join(stub, "debian"))
+        with open(os.path.join(stub, "debian", "control"), "w") as handle:
+            handle.write("Source: stub\n\nPackage: stub\nArchitecture: any\n")
+
+        cmd = ["dpkg-shlibdeps", "-O", "--ignore-missing-info"]
+        for private in args.private_libdir:
+            cmd.append("-l%s" % os.path.abspath(private))
+        # Vendor libraries live inside the package itself, so let them satisfy
+        # each other rather than being reported as missing.
+        for libdir in LIBDIRS:
+            candidate = os.path.join(root, libdir)
+            if os.path.isdir(candidate):
+                cmd.append("-l%s" % os.path.abspath(candidate))
+        for exclude in args.shlibdeps_exclude:
+            cmd.append("-X%s" % exclude)
+        cmd += binaries
+
+        result = subprocess.run(cmd, cwd=stub, text=True, capture_output=True)
+        if result.stderr.strip():
+            for line in result.stderr.strip().splitlines():
+                print("    dpkg-shlibdeps: %s" % line, file=sys.stderr)
+        if result.returncode != 0:
+            raise SystemExit("dpkg-shlibdeps failed on %s" % root)
+
+    for line in result.stdout.splitlines():
+        if line.startswith("shlibs:Depends="):
+            return line.split("=", 1)[1].strip()
+    return None
+
+
+def write_shlibs(root, package, version, args):
+    """DEBIAN/shlibs, so other packages can depend on these libraries.
+
+    Without it dpkg-shlibdeps finds no dependency information for anything
+    linking against this package -- lintian's no-shlibs -- and a container image
+    building against the vendor stack gets no dependency at all.  dh_makeshlibs
+    does this in a normal Debian build; package_deb has no equivalent.
+
+    Policy format is "library soname-version dependency", e.g.
+    "libfsldspframework 1 imx-dsp (>= 2.1.9)".  Private plugins that are not
+    meant to be linked against should be excluded with --makeshlibs-exclude,
+    the same way dh_makeshlibs -X is used for them.
+    """
+    upstream = version.rsplit("-", 1)[0] if "-" in version else version
+    lines = []
+    for path in elf_files(root):
+        name = soname(path)
+        if not name or ".so." not in name:
+            continue
+        relative = os.path.relpath(path, root)
+        if any(pattern in relative for pattern in args.makeshlibs_exclude):
+            continue
+        stem, _, sover = name.partition(".so.")
+        entry = "%s %s %s (>= %s)\n" % (stem, sover, package, upstream)
+        if entry not in lines:
+            lines.append(entry)
+    if not lines:
+        return
+    path = os.path.join(root, "DEBIAN", "shlibs")
+    with open(path, "w") as handle:
+        handle.writelines(sorted(lines))
+    os.chmod(path, 0o644)
+
+
+def write_triggers(root):
+    """Debian activates ldconfig through a trigger, not a postinst call."""
+    if not ships_shared_library(root):
+        return False
+    path = os.path.join(root, "DEBIAN", "triggers")
+    existing = ""
+    if os.path.exists(path):
+        with open(path) as handle:
+            existing = handle.read()
+    if "ldconfig" not in existing:
+        with open(path, "a") as handle:
+            handle.write("activate-noawait ldconfig\n")
+        os.chmod(path, 0o644)
+    return True
+
+
+def strip_ldconfig_from_scripts(root):
+    """Drop OE's manual ldconfig calls now that the trigger handles it."""
+    for script in ("postinst", "postrm"):
+        path = os.path.join(root, "DEBIAN", script)
+        if not os.path.exists(path):
+            continue
+        with open(path) as handle:
+            lines = handle.readlines()
+        kept = [l for l in lines if "ldconfig" not in l]
+        # What OE leaves behind is a shebang and an 'if [ x"$D" = "x" ]' guard
+        # around the ldconfig call; with the call gone the wrapper is inert.
+        meaningful = [l for l in kept
+                      if l.strip() and not l.startswith("#!")
+                      and l.strip() not in ("fi", "then", "else", ":", "exit 0")
+                      and not l.strip().startswith("if ")]
+        if meaningful:
+            with open(path, "w") as handle:
+                handle.writelines(kept)
+        else:
+            os.unlink(path)
+
+
+def write_copyright(root, package, args):
+    """Machine-readable DEP-5 copyright.
+
+    The license text is taken from --license-file when given: that is the same
+    file the recipe points LIC_FILES_CHKSUM at, so it is the license actually
+    shipped rather than a guess.
+    """
+    docdir = os.path.join(root, "usr", "share", "doc", package)
+    makedirs(docdir)
+    # The directory may have arrived from OE with a umask-dependent mode; this
+    # script owns it, so pin it.
+    os.chmod(docdir, 0o755)
+
+    body = ["Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\n",
+            "Upstream-Name: %s\n" % package]
+    if args.upstream_contact:
+        body.append("Upstream-Contact: %s\n" % args.upstream_contact)
+    body.append("\nFiles: *\n")
+    body.append("Copyright: %s\n" % args.copyright_holder)
+    body.append("License: %s\n" % args.license)
+
+    body.append("\nLicense: %s\n" % args.license)
+    if args.license_file and os.path.exists(args.license_file):
+        with open(args.license_file, errors="replace") as handle:
+            for line in handle.read().splitlines():
+                body.append(" %s\n" % (line.rstrip() or "."))
+    else:
+        body.append(" Redistributable vendor license; see the package contents.\n")
+
+    path = os.path.join(docdir, "copyright")
+    with open(path, "w") as handle:
+        handle.writelines(body)
+    os.chmod(path, 0o644)
+
+
+def write_changelog(root, package, version, args):
+    docdir = os.path.join(root, "usr", "share", "doc", package)
+    makedirs(docdir)
+    # The directory may have arrived from OE with a umask-dependent mode; this
+    # script owns it, so pin it.
+    os.chmod(docdir, 0o755)
+    entry = ("%s (%s) %s; urgency=medium\n\n"
+             "  * Built from the OpenEmbedded recipe by torizon-deb.bbclass.\n\n"
+             " -- %s  %s\n") % (package, version, args.dist, args.maintainer,
+                                args.date)
+    path = os.path.join(docdir, "changelog.Debian.gz")
+    # mtime=0 so repeated runs produce identical bytes.
+    with gzip.GzipFile(path, "wb", mtime=0) as handle:
+        handle.write(entry.encode())
+    os.chmod(path, 0o644)
+
+
+def relocate_docdir(root, old, new):
+    """OE names the doc directory after the OE package; Debian wants the
+    binary package name, which may have been renamed."""
+    if old == new:
+        return
+    base = os.path.join(root, "usr", "share", "doc")
+    src, dst = os.path.join(base, old), os.path.join(base, new)
+    if os.path.isdir(src) and not os.path.exists(dst):
+        shutil.move(src, dst)
+
+
+def write_md5sums(root):
+    """dpkg-deb does not generate DEBIAN/md5sums; dh_md5sums normally would."""
+    entries = []
+    for dirpath, dirs, files in os.walk(root):
+        dirs.sort()
+        rel = os.path.relpath(dirpath, root)
+        if rel == "DEBIAN" or rel.startswith("DEBIAN" + os.sep):
+            continue
+        for name in sorted(files):
+            path = os.path.join(dirpath, name)
+            if os.path.islink(path) or not os.path.isfile(path):
+                continue
+            digest = hashlib.md5()
+            with open(path, "rb") as handle:
+                for chunk in iter(lambda: handle.read(65536), b""):
+                    digest.update(chunk)
+            relpath = os.path.relpath(path, root)
+            entries.append("%s  %s\n" % (digest.hexdigest(), relpath))
+    path = os.path.join(root, "DEBIAN", "md5sums")
+    if entries:
+        with open(path, "w") as handle:
+            handle.writelines(entries)
+        os.chmod(path, 0o644)
+    elif os.path.exists(path):
+        os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# driver
+# ---------------------------------------------------------------------------
+
+def debianize(deb, args):
+    print("==> %s" % os.path.basename(deb))
+    workdir = tempfile.mkdtemp(prefix="debianize-")
+    try:
+        root = os.path.join(workdir, "pkg")
+        run(["dpkg-deb", "-R", deb, root])
+
+        with open(os.path.join(root, "DEBIAN", "control")) as handle:
+            control = Control(handle.read())
+
+        oe_name = control.get("Package")
+        package = args.rename.get(oe_name)
+        if not package and args.auto_name:
+            package = derive_name(root)
+        package = package or oe_name
+        if package != oe_name:
+            print("    rename: %s -> %s" % (oe_name, package))
+        control.set("Package", package)
+        relocate_docdir(root, oe_name, package)
+
+        for field in JUNK_FIELDS:
+            control.drop(field)
+
+        arch = control.get("Architecture", "all")
+        section = control.get("Section", "misc")
+        if "/" not in section:
+            section = "%s/%s" % (section,
+                                 "libdevel" if package.endswith("-dev") else "libs")
+        control.set("Section", args.section or section)
+        control.set("Priority", args.priority)
+        control.set("Maintainer", args.maintainer)
+        if args.homepage:
+            control.set("Homepage", args.homepage)
+        if args.vcs_git:
+            control.set("Vcs-Git", args.vcs_git)
+        if args.vcs_browser:
+            control.set("Vcs-Browser", args.vcs_browser)
+
+        # Multi-Arch: same would require the multiarch libdir, and these
+        # packages deliberately install into /usr/lib so that vendor plugin
+        # search paths keep working.  foreign is correct for arch-all only.
+        if arch == "all":
+            control.set("Multi-Arch", "foreign")
+        else:
+            control.drop("Multi-Arch")
+
+        if args.no_shlibdeps:
+            print("    Depends: kept from OE (--no-shlibdeps)")
+        else:
+            depends = compute_depends(root, args)
+            if depends:
+                if args.extra_depends:
+                    depends = "%s, %s" % (depends, args.extra_depends)
+                control.set("Depends", depends)
+                print("    Depends: %s" % depends)
+            elif args.extra_depends:
+                control.set("Depends", args.extra_depends)
+
+        if write_triggers(root):
+            strip_ldconfig_from_scripts(root)
+
+        version = control.get("Version")
+        if not args.no_shlibs_file:
+            write_shlibs(root, package, version, args)
+        write_copyright(root, package, args)
+        write_changelog(root, package, version, args)
+        write_md5sums(root)
+
+        control_path = os.path.join(root, "DEBIAN", "control")
+        with open(control_path, "w") as handle:
+            handle.write(control.render())
+        os.chmod(control_path, 0o644)
+
+        normalize_times(root, args.epoch)
+        os.environ["SOURCE_DATE_EPOCH"] = str(args.epoch)
+
+        makedirs(args.outdir)
+        out = os.path.join(args.outdir, "%s_%s_%s.deb" % (package, version, arch))
+        run(["dpkg-deb", "--build", "--root-owner-group", root, out])
+        print("    wrote %s" % out)
+
+        if args.lintian:
+            result = subprocess.run(["lintian", "--no-tag-display-limit", out],
+                                    text=True, capture_output=True)
+            for line in (result.stdout + result.stderr).splitlines():
+                print("    %s" % line)
+        return out
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def reexec_in_docker(args, argv):
+    """Re-run inside an arm64 Debian container.
+
+    dpkg-shlibdeps reads the local shlibs data, so it has to run where the
+    dpkg architecture matches the packages being processed.
+    """
+    cwd = os.getcwd()
+    cmd = ["docker", "run", "--rm", "--platform", "linux/arm64",
+           "-v", "%s:%s" % (cwd, cwd), "-w", cwd, args.docker_image,
+           "sh", "-c",
+           "apt-get update -qq && apt-get install -y -qq --no-install-recommends "
+           "dpkg-dev binutils%s >/dev/null && exec python3 %s" % (
+               " lintian" if args.lintian else "",
+               " ".join("'%s'" % a for a in argv if a != "--docker"))]
+    print("re-executing in %s (linux/arm64)" % args.docker_image)
+    os.execvp("docker", cmd)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Make OE package_deb output Debian-valid.")
+    parser.add_argument("debs", nargs="+", help=".deb files or directories")
+    parser.add_argument("-o", "--outdir", default="debianized")
+    parser.add_argument("--dist", default="forky")
+    parser.add_argument("--maintainer",
+                        default="Toradex Packaging Team <debian-pkg-team@toradex.com>")
+    parser.add_argument("--date", default="Thu, 01 Jan 2026 00:00:00 +0000",
+                        help="changelog date; fixed by default so output is "
+                             "reproducible")
+    parser.add_argument("--epoch", type=int, default=1767225600,
+                        help="fixed mtime for reproducible output "
+                             "(default 2026-01-01)")
+    parser.add_argument("--priority", default="optional")
+    parser.add_argument("--section", help="override Section entirely")
+    parser.add_argument("--homepage")
+    parser.add_argument("--vcs-git")
+    parser.add_argument("--vcs-browser")
+    parser.add_argument("--license", default="Proprietary")
+    parser.add_argument("--license-file",
+                        help="license text to embed in debian/copyright, "
+                             "normally the file LIC_FILES_CHKSUM points at")
+    parser.add_argument("--copyright-holder", default="the respective vendor")
+    parser.add_argument("--upstream-contact")
+    parser.add_argument("--rename", action="append", default=[],
+                        metavar="OLD=NEW", help="rename a binary package")
+    parser.add_argument("--auto-name", action="store_true",
+                        help="derive libfooN from the SONAME when the package "
+                             "ships exactly one versioned library")
+    parser.add_argument("--extra-depends", default="",
+                        help="appended to the computed Depends")
+    parser.add_argument("--shlibdeps-exclude", action="append", default=[],
+                        metavar="GLOB", help="passed to dpkg-shlibdeps as -X")
+    parser.add_argument("--makeshlibs-exclude", action="append", default=[],
+                        metavar="SUBSTR",
+                        help="skip these libraries in DEBIAN/shlibs, for private "
+                             "plugins not meant to be linked against")
+    parser.add_argument("--no-shlibs-file", action="store_true",
+                        help="do not generate DEBIAN/shlibs")
+    parser.add_argument("--private-libdir", action="append", default=[],
+                        metavar="DIR", help="passed to dpkg-shlibdeps as -l")
+    parser.add_argument("--no-shlibdeps", action="store_true",
+                        help="keep OE's Depends untouched")
+    parser.add_argument("--lintian", action="store_true")
+    parser.add_argument("--docker", action="store_true",
+                        help="re-exec inside an arm64 Debian container")
+    parser.add_argument("--docker-image", default="debian:forky")
+    args = parser.parse_args()
+
+    if args.docker:
+        reexec_in_docker(args, [sys.argv[0]] + sys.argv[1:])
+
+    args.rename = dict(entry.split("=", 1) for entry in args.rename)
+
+    targets = []
+    for item in args.debs:
+        if os.path.isdir(item):
+            for dirpath, _dirs, files in os.walk(item):
+                targets += [os.path.join(dirpath, f)
+                            for f in sorted(files) if f.endswith(".deb")]
+        else:
+            targets.append(item)
+    if not targets:
+        raise SystemExit("no .deb files found")
+
+    for deb in targets:
+        debianize(deb, args)
+
+
+if __name__ == "__main__":
+    main()
